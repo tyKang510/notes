@@ -428,11 +428,45 @@
     .tx-row .cat{ display:none; }
     .pie-wrap{ flex-direction:column; align-items:flex-start; }
   }
+
+  /* ---------- Lock screen ---------- */
+  #lockScreen{
+    position:fixed; inset:0; background:var(--bg);
+    display:flex; align-items:center; justify-content:center;
+    z-index:999;
+  }
+  #lockScreen.hidden{ display:none; }
+  .lock-box{ width:100%; max-width:320px; padding:0 24px; text-align:center; }
+  .lock-box .wordmark{ margin-bottom:8px; display:block; }
+  .lock-box p{ color:var(--text-muted); font-size:13px; margin:0 0 24px; }
+  .lock-box input{
+    width:100%; background:none; border:1px solid var(--border);
+    color:var(--text); font-family:'Inter', sans-serif; font-size:14px;
+    padding:10px 12px; outline:none; margin-bottom:12px;
+  }
+  .lock-box input:focus{ border-color:var(--accent); }
+  .lock-box .btn{ width:100%; }
+  .lock-box .lock-err{ color:var(--negative); font-size:12.5px; margin-top:10px; min-height:16px; }
+  .app.locked{ display:none; }
+
+  .export-import{ display:flex; gap:14px; margin-top:14px; align-items:center; flex-wrap:wrap; }
+  .export-import input[type="file"]{ display:none; }
 </style>
 </head>
 <body>
 
-<div class="app">
+<div id="lockScreen">
+  <div class="lock-box">
+    <span class="wordmark">Ledger</span>
+    <p id="lockPrompt">Loading…</p>
+    <input type="password" id="lockPasswordInput" placeholder="Password">
+    <input type="password" id="lockConfirmInput" placeholder="Confirm password" style="display:none;">
+    <button class="btn" id="lockSubmit">Continue</button>
+    <div class="lock-err" id="lockError"></div>
+  </div>
+</div>
+
+<div class="app locked" id="appRoot">
 
   <div class="header">
     <div class="wordmark">Ledger</div>
@@ -492,6 +526,18 @@
         </div>
         <button class="btn" id="saveBudgets">Save settings</button>
         <button class="btn-quiet" id="clearAllData">Clear all data</button>
+
+        <div class="export-import">
+          <button class="btn" id="exportBackup">Export backup</button>
+          <button class="btn" id="importBackupBtn">Import backup</button>
+          <input type="file" id="importFileInput" accept="application/json">
+          <span class="bulk-status" id="backupStatus"></span>
+        </div>
+        <div class="hint" style="margin-top:8px;">Export saves a file to your device. Import adds entries from a backup file without deleting what's already here — use this to carry data between your phone and PC yourself.</div>
+
+        <div class="hint" style="margin-top:20px; border-top:1px solid var(--border-soft); padding-top:16px;">
+          <a id="changePasswordLink" style="cursor:pointer; text-decoration:underline; text-decoration-color:var(--border); color:var(--text-faint);">Change password</a>
+        </div>
       </div>
     </div>
 
@@ -551,7 +597,7 @@
     <div id="txList"></div>
   </div>
 
-  <footer>Your entries are stored privately in this browser and only visible to you.</footer>
+  <footer>Your entries are stored privately in this browser, protected by your password, and never sent anywhere.</footer>
 </div>
 
 <script>
@@ -1186,7 +1232,127 @@
     }
   });
 
-  loadData();
+  document.getElementById('exportBackup').addEventListener('click', () => {
+    const payload = { transactions, settings, exportedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ledger-backup-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  document.getElementById('importBackupBtn').addEventListener('click', () => {
+    document.getElementById('importFileInput').click();
+  });
+
+  document.getElementById('importFileInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    const status = document.getElementById('backupStatus');
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        const data = JSON.parse(reader.result);
+        const incoming = Array.isArray(data.transactions) ? data.transactions : [];
+        const existingIds = new Set(transactions.map(t => t.id));
+        const toAdd = incoming.filter(t => t && t.id && !existingIds.has(t.id));
+        transactions = transactions.concat(toAdd);
+
+        if(data.settings){
+          const hasNoBudgets = !settings.budgets || Object.keys(settings.budgets).length === 0;
+          const hasNoGoal = !settings.savingsGoal || !settings.savingsGoal.target;
+          if(hasNoBudgets && data.settings.budgets) settings.budgets = data.settings.budgets;
+          if(hasNoGoal && data.settings.savingsGoal) settings.savingsGoal = data.settings.savingsGoal;
+        }
+
+        saveTransactions();
+        saveSettings();
+        status.textContent = `Imported ${toAdd.length} new entr${toAdd.length===1?'y':'ies'} (${incoming.length - toAdd.length} already present).`;
+        render();
+      }catch(err){
+        status.textContent = 'Could not read that file — is it a ledger backup JSON?';
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+  });
+
+  // ---------- Password lock ----------
+  const PW_KEY = 'ledger_pw_hash';
+  const UNLOCK_KEY = 'ledger_unlocked';
+
+  function simpleHash(str){
+    let h = 0;
+    for(let i = 0; i < str.length; i++){
+      h = (Math.imul(h, 31) + str.charCodeAt(i)) >>> 0;
+    }
+    return h.toString(36);
+  }
+
+  function showApp(){
+    document.getElementById('lockScreen').classList.add('hidden');
+    document.getElementById('appRoot').classList.remove('locked');
+    loadData();
+  }
+
+  function initLock(){
+    const storedHash = localStorage.getItem(PW_KEY);
+    const alreadyUnlocked = sessionStorage.getItem(UNLOCK_KEY) === 'true';
+
+    if(alreadyUnlocked){
+      showApp();
+      return;
+    }
+
+    const prompt = document.getElementById('lockPrompt');
+    const pwInput = document.getElementById('lockPasswordInput');
+    const confirmInput = document.getElementById('lockConfirmInput');
+    const submitBtn = document.getElementById('lockSubmit');
+    const errEl = document.getElementById('lockError');
+    const isSetup = !storedHash;
+
+    if(isSetup){
+      prompt.textContent = 'Set a password to protect this ledger.';
+      confirmInput.style.display = 'block';
+    } else {
+      prompt.textContent = 'Enter your password to continue.';
+      confirmInput.style.display = 'none';
+    }
+
+    function attempt(){
+      const pw = pwInput.value;
+      if(!pw){ errEl.textContent = 'Enter a password.'; return; }
+
+      if(isSetup){
+        const confirm = confirmInput.value;
+        if(pw !== confirm){ errEl.textContent = "Passwords don't match."; return; }
+        if(pw.length < 4){ errEl.textContent = 'Use at least 4 characters.'; return; }
+        localStorage.setItem(PW_KEY, simpleHash(pw));
+        sessionStorage.setItem(UNLOCK_KEY, 'true');
+        showApp();
+      } else {
+        if(simpleHash(pw) !== storedHash){ errEl.textContent = 'Incorrect password.'; pwInput.value=''; pwInput.focus(); return; }
+        sessionStorage.setItem(UNLOCK_KEY, 'true');
+        showApp();
+      }
+    }
+
+    submitBtn.addEventListener('click', attempt);
+    pwInput.addEventListener('keydown', (e) => { if(e.key === 'Enter' && confirmInput.style.display === 'none') attempt(); });
+    confirmInput.addEventListener('keydown', (e) => { if(e.key === 'Enter') attempt(); });
+    pwInput.focus();
+  }
+
+  document.getElementById('changePasswordLink').addEventListener('click', () => {
+    if(!confirm('This will require setting a new password before the ledger can be opened again on this browser. Continue?')) return;
+    localStorage.removeItem(PW_KEY);
+    sessionStorage.removeItem(UNLOCK_KEY);
+    location.reload();
+  });
+
+  initLock();
 })();
 </script>
 
